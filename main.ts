@@ -1,52 +1,45 @@
-const kv = await Deno.openKv();
+import { Bot, webhookCallback } from "https://deno.land/x/grammy@v1.19.0/mod.ts";
+import jackrabbit from "npm:@pager/jackrabbit";
 
-interface Value {
-  nonce: string;
-  msg: unknown;
-  url: string;
-}
+const rabbit = jackrabbit(Deno.env.get("AMQPS_URL"));
 
-kv.listenQueue(async (value) => {
-  const { nonce, msg, url } = (value as Value);
-  const kvNonce = await kv.get(["nonces", nonce]);
-  if (kvNonce.value === null) {
-    // This messaged was already processed.
+var exchange = rabbit.default();
+var pushQueue = exchange.queue({ name: 'push-queue', durable: true });
+
+const bot = new Bot(Deno.env.get("BOT_TOKEN"));
+
+bot.command('queue', async ctx => {
+  const count = Number(ctx.match);
+  if (!ctx.match || isNaN(count)) {
+    await ctx.reply('Usage: /queue <count>');
     return;
   }
 
-  await fetch(url, {
-    method: "POST",
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(msg),
-  });
-
-  const success = await kv.atomic()
-    // Ensure this message was not yet processed
-    .check({ key: kvNonce.key, versionstamp: kvNonce.versionstamp })
-    .delete(kvNonce.key)
-    .sum(["processed_count"], 1n)
-    .commit();
+  for (let i = 0; i < count; i++) {
+    await exchange.publish(
+      { chat_id: "some chat id", text: `Test text ${i}` },
+      { key: 'push-queue' },
+    );
+  }
+  await ctx.reply('Task has been scheduled');
 });
 
 Deno.serve(async (req: Request) => {
   try {
-    const jsonReq = await req.json();
-    const nonce = crypto.randomUUID();
+    const url = new URL(req.url);
+    const path = url.pathname;
 
-    const { msg, delay, url } = jsonReq;
-    if (!url) {
-      throw Error("url is required");
+    if (path === '/amqp-push') {
+      console.log(JSON.stringify(req));
+      const { chat_id, text } = await req.json();
+      await bot.api.sendMessage(chat_id, text);
+      return new Response('ok', { status: 200 });
+    } else if (path === '/telegram') {
+      await webhookCallback(bot, 'std/http')(req);
+      return new Response('ok', { status: 200 });
+    } else {
+      return new Response('not found', { status: 404 });
     }
-
-    await kv
-      .atomic()
-      .check({ key: ["nonces", nonce], versionstamp: null })
-      .enqueue({ nonce, msg, url }, { delay: delay ?? 10 })
-      .set(["nonces", nonce], true)
-      .sum(["enqueued_count"], 1n)
-      .commit();
-
-    return new Response("ok", { status: 200 });
   } catch (err) {
     console.error(err);
     return new Response(err, { status: 500 });
